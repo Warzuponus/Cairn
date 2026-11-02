@@ -27,6 +27,12 @@ from cairn.server.models import Intent, ProjectDetail, ProjectSummary
 LOG = logging.getLogger(__name__)
 UNHEALTHY_RETRY_AFTER_SECONDS = 5
 REJECTED_RETRY_AFTER_SECONDS = 5
+# A reason task that keeps failing (e.g. the model won't emit valid JSON) would
+# otherwise re-dispatch every tick forever. Back off with an escalating delay and
+# cap consecutive failures so a stuck challenge gets flagged, not looped.
+REASON_FAIL_BACKOFF_BASE_SECONDS = 15
+REASON_FAIL_BACKOFF_MAX_SECONDS = 180
+REASON_FAIL_STUCK_AFTER = 5
 BOOTSTRAP_INTENT_DESCRIPTION = "bootstrap"
 BOOTSTRAP_INTENT_CREATOR = "dispatcher.bootstrap"
 
@@ -58,6 +64,10 @@ class DispatcherLoop:
         self.runtime_project_ids: set[str] = set()
         self.worker_unhealthy_until: dict[str, float] = {}
         self.worker_rejected_until: dict[tuple[str, str, str], float] = {}
+        # Per-project reason-failure backoff: (last failed trigger, consecutive
+        # failures, backoff-until, stuck-flag). Prevents a stuck reason loop from
+        # re-dispatching every tick forever.
+        self.reason_fail_state: dict[str, tuple[str, int, float, bool]] = {}
         self._log_state: dict[str, tuple[int, str, tuple[object, ...]]] = {}
         self._cleanup_pending: set[str] = set()
         self._inactive_cleanup_done: dict[str, str] = {}
@@ -364,6 +374,20 @@ class DispatcherLoop:
         return self._dispatch_bootstrap(project, intent)
 
     def _dispatch_reason(self, project: ProjectDetail, export_yaml: str, trigger: str) -> bool:
+        # Backoff: if this same trigger already failed recently, wait before
+        # re-dispatching. A fresh trigger (real graph change) is never blocked.
+        now = time.time()
+        state = self.reason_fail_state.get(project.project.id)
+        if state is not None:
+            last_trigger, fails, backoff_until, stuck = state
+            if trigger == last_trigger and now < backoff_until:
+                self._log_changed(
+                    f"project:{project.project.id}:reason_backoff",
+                    logging.INFO,
+                    "skip reason project=%s trigger=%s in backoff (%.0fs remaining, %d consecutive failures, stuck=%s)",
+                    project.project.id, trigger, backoff_until - now, fails, stuck,
+                )
+                return False
         selection = self._select_worker(project.project.id, "reason")
         worker = selection.worker
         if worker is None:
@@ -421,6 +445,7 @@ class DispatcherLoop:
             fact_count=len(project.facts),
             hint_count=len(project.hints),
             open_intent_count=self._project_open_intent_count(project),
+            reason_trigger=trigger,
         )
         self.runtime_project_ids.add(project.project.id)
         self._clear_project_log_state(project.project.id)
@@ -762,6 +787,12 @@ class DispatcherLoop:
                     )
                 else:
                     self.worker_rejected_until.pop(rejection_key, None)
+                # Reason-failure backoff: a reason task that failed with the same
+                # trigger (no graph progress) backs off with an escalating delay;
+                # after N consecutive failures it is flagged stuck. A fresh
+                # trigger (real graph change) resets the streak.
+                if task.task_type == "reason" and task.reason_trigger is not None:
+                    self._record_reason_failure(task, outcome)
                 if outcome == "success" and task.task_type == "reason":
                     assert task.fact_count is not None
                     assert task.hint_count is not None
@@ -780,6 +811,43 @@ class DispatcherLoop:
                     )
             except Exception:
                 LOG.exception("task crashed project=%s task=%s worker=%s", task.project_id, task.task_type, task.worker_name)
+
+    def _record_reason_failure(self, task: RunningTask, outcome: str) -> None:
+        """Track consecutive reason failures for backoff + stuck flagging.
+
+        Only a *failed* outcome on the *same* trigger counts as a repeat. A
+        fresh trigger (real graph change) resets the streak. A success clears
+        it. This is what stops a stuck challenge (e.g. the model never emits
+        valid JSON) from re-dispatching reason every tick forever.
+        """
+        project_id = task.project_id
+        trigger = task.reason_trigger
+        if trigger is None:
+            return
+        now = time.time()
+        prev = self.reason_fail_state.get(project_id)
+        if outcome == "success":
+            self.reason_fail_state.pop(project_id, None)
+            return
+        if outcome != "failed":
+            # cancelled / unhealthy / rejected are handled by their own backoff.
+            return
+        if prev is not None and prev[0] == trigger:
+            fails = prev[1] + 1
+        else:
+            fails = 1
+        delay = min(
+            REASON_FAIL_BACKOFF_BASE_SECONDS * (2 ** (fails - 1)),
+            REASON_FAIL_BACKOFF_MAX_SECONDS,
+        )
+        stuck = fails >= REASON_FAIL_STUCK_AFTER
+        self.reason_fail_state[project_id] = (trigger, fails, now + delay, stuck)
+        level = logging.WARNING if stuck else logging.INFO
+        LOG.log(
+            level,
+            "reason backoff project=%s trigger=%s consecutive_failures=%d next_retry_in=%.0fs stuck=%s",
+            project_id, trigger, fails, delay, stuck,
+        )
 
     def _cleanup_completed_containers(self, summaries: list[ProjectSummary]) -> None:
         for summary in summaries:

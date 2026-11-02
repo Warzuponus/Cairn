@@ -331,3 +331,59 @@ def test_startup_only_worker_healthcheck_runs_automatic_startup_check() -> None:
     loop.run_startup_healthchecks()
 
     assert calls == [False]
+
+
+def _bare_loop() -> "DispatcherLoop":
+    from cairn.dispatcher.scheduler.loop import DispatcherLoop
+    loop = DispatcherLoop.__new__(DispatcherLoop)
+    loop.config = None
+    loop.client = None
+    loop.container_manager = None
+    loop.executor = None
+    loop.cleanup_executor = None
+    loop.futures = {}
+    loop.cleanup_futures = {}
+    loop.reason_checkpoints = {}
+    loop.runtime_project_ids = set()
+    loop.worker_unhealthy_until = {}
+    loop.worker_rejected_until = {}
+    loop.reason_fail_state = {}
+    loop._log_state = {}
+    loop._cleanup_pending = set()
+    loop._inactive_cleanup_done = {}
+    loop.project_cursor = 0
+    loop._settings_checked = False
+    loop._startup_healthchecks_checked = False
+    return loop
+
+
+def test_reason_failure_backoff_escalates_and_flags_stuck():
+    from cairn.dispatcher.models import RunningTask
+    from cairn.dispatcher.scheduler.loop import DispatcherLoop
+
+    loop = _bare_loop()
+    task = RunningTask(
+        project_id="proj_x", task_type="reason", worker_name="w",
+        cancellation=None, reason_trigger="facts:2->3",
+    )
+    # first failure -> 15s backoff, not stuck
+    loop._record_reason_failure(task, "failed")
+    _, fails1, delay1, stuck1 = loop.reason_fail_state["proj_x"]
+    assert fails1 == 1 and delay1 > 0 and stuck1 is False
+    # second failure (same trigger) -> 30s
+    loop._record_reason_failure(task, "failed")
+    _, fails2, delay2, stuck2 = loop.reason_fail_state["proj_x"]
+    assert fails2 == 2 and delay2 > delay1 and stuck2 is False
+    # a fresh trigger resets the streak
+    task2 = RunningTask("proj_x", "reason", "w", None, reason_trigger="facts:3->4")
+    loop._record_reason_failure(task2, "failed")
+    _, fails3, _, _ = loop.reason_fail_state["proj_x"]
+    assert fails3 == 1
+    # success clears the backoff
+    loop._record_reason_failure(task2, "success")
+    assert "proj_x" not in loop.reason_fail_state
+    # 5 consecutive failures on the same trigger -> stuck
+    for _ in range(5):
+        loop._record_reason_failure(task, "failed")
+    _, fails5, _, stuck5 = loop.reason_fail_state["proj_x"]
+    assert fails5 == 5 and stuck5 is True
